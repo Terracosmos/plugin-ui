@@ -95,15 +95,52 @@
               variant="outlined"
               class="mb-2"
             />
-            <v-text-field
+
+            <!-- NEW: auto-suggest for the team leader.
+                 Queries rest/system/user/roles as the user types (debounced).
+                 The v-model stores the user's login as a string, matching
+                 what the rest/project endpoint expects in the payload. -->
+            <v-autocomplete
               v-model="editForm.teamLeader"
-              label="Team leader (user id)"
+              :items="userSearchResults"
+              :loading="userSearchLoading"
+              :search="userSearchQuery"
+              item-title="login"
+              item-value="login"
+              label="Team leader"
               :rules="[rules.required]"
-              :hint="'Identifier of the user managing this project'"
+              hint="Tape quelques lettres pour chercher un utilisateur"
               persistent-hint
               variant="outlined"
               class="mb-2"
-            />
+              no-filter
+              clearable
+              @update:search="onUserSearch"
+            >
+              <template #item="{ props, item }">
+                <v-list-item v-bind="props" :title="item.raw.login">
+                  <template #subtitle>
+                    <v-chip
+                      v-for="r in (item.raw.roles || [])"
+                      :key="r.id"
+                      size="x-small"
+                      variant="tonal"
+                      class="mr-1"
+                    >
+                      {{ r.name }}
+                    </v-chip>
+                  </template>
+                </v-list-item>
+              </template>
+              <template #no-data>
+                <v-list-item>
+                  <v-list-item-title>
+                    {{ userSearchQuery ? 'Aucun utilisateur trouvé' : 'Tape des lettres pour chercher' }}
+                  </v-list-item-title>
+                </v-list-item>
+              </template>
+            </v-autocomplete>
+
             <v-textarea
               v-model="editForm.description"
               label="Description"
@@ -173,6 +210,12 @@ const deleting = ref(false)
 const deleteWithData = ref(false)
 let lastPkeyAuto = ''
 
+// --- Team leader auto-suggest state ---
+const userSearchQuery = ref('')
+const userSearchResults = ref([])
+const userSearchLoading = ref(false)
+let userSearchDebounce = null
+
 const headers = computed(() => [
   { title: 'Name', key: 'name', sortable: true, width: '220px' },
   { title: 'Description', key: 'description', sortable: false },
@@ -214,10 +257,62 @@ function generatePkey(name) {
 function onNameChanged() {
   if (editTarget.value?.nbSubscriptions > 0) return
   const pk = generatePkey(editForm.value.name)
-  // Only auto-fill if the user hasn't hand-edited the pkey since we last wrote it
   if (!editForm.value.pkey || editForm.value.pkey === lastPkeyAuto) {
     editForm.value.pkey = pk
     lastPkeyAuto = pk
+  }
+}
+
+// --- Team leader auto-suggest logic ---
+
+/**
+ * Called on every keystroke in the autocomplete. We debounce so the
+ * backend doesn't get spammed: one request per 300 ms of idle typing.
+ */
+function onUserSearch(query) {
+  userSearchQuery.value = query || ''
+  clearTimeout(userSearchDebounce)
+  userSearchDebounce = setTimeout(() => searchUsers(query), 300)
+}
+
+async function searchUsers(query) {
+  if (!query || query.length < 1) {
+    userSearchResults.value = []
+    return
+  }
+  userSearchLoading.value = true
+  try {
+    const params = new URLSearchParams({
+      'search[value]': query,
+      rows: '20',
+      page: '1',
+      sidx: 'login',
+      sord: 'asc',
+    })
+    const resp = await api.get(`rest/system/user/roles?${params.toString()}`)
+    userSearchResults.value = Array.isArray(resp?.data) ? resp.data : []
+  } catch (err) {
+    console.error('Team leader search failed:', err)
+    userSearchResults.value = []
+  } finally {
+    userSearchLoading.value = false
+  }
+}
+
+/**
+ * When editing an existing project, the teamLeader is already set but the
+ * autocomplete's item list is empty — so the chip wouldn't display a label.
+ * This seeds the list with the current user so the UI is coherent on open.
+ */
+async function ensureCurrentUserInResults(login) {
+  if (!login) return
+  try {
+    const params = new URLSearchParams({ 'search[value]': login, rows: '5', page: '1', sidx: 'login', sord: 'asc' })
+    const resp = await api.get(`rest/system/user/roles?${params.toString()}`)
+    const users = Array.isArray(resp?.data) ? resp.data : []
+    userSearchResults.value = users.length ? users : [{ login, roles: [] }]
+  } catch {
+    userSearchResults.value = [{ login, roles: [] }]
   }
 }
 
@@ -225,6 +320,8 @@ function openNew() {
   editTarget.value = null
   editForm.value = { name: '', pkey: '', teamLeader: '', description: '' }
   lastPkeyAuto = ''
+  userSearchResults.value = []
+  userSearchQuery.value = ''
   editDialog.value = true
 }
 
@@ -237,6 +334,9 @@ function openEdit(item) {
     description: item.description || '',
   }
   lastPkeyAuto = item.pkey || ''
+  userSearchQuery.value = ''
+  userSearchResults.value = []
+  ensureCurrentUserInResults(item.teamLeader?.id)
   editDialog.value = true
 }
 
@@ -267,7 +367,6 @@ async function save() {
   if (id !== null) {
     editDialog.value = false
     if (!editTarget.value?.id && typeof id !== 'object') {
-      // Creation returned a numeric id — navigate to the detail view
       router.push(`/home/project/${id}`)
     } else {
       dt.load(lastOptions)
